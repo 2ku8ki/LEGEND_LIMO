@@ -18,9 +18,9 @@ RUN apt-get update && \
       ros-melodic-tf \
       && rm -rf /var/lib/apt/lists/*
 
-# 4) ROS Python3 유틸 (rospkg, catkin_pkg, catkin_tools) - pip로만
+# 4) ROS Python3 유틸 (rospkg, catkin_pkg, catkin_tools + 백포트)
 RUN pip3 install --no-cache-dir \
-      rospkg catkin_pkg catkin_tools
+      rospkg catkin_pkg catkin_tools "importlib-metadata<5"
 
 # 5) Python3용 cv_bridge 빌드 (LKAS에서 필요)
 RUN mkdir -p /opt/cvbridge_ws/src
@@ -50,6 +50,8 @@ RUN chmod +x /ros_entrypoint.sh
 
 ENTRYPOINT ["/ros_entrypoint.sh"]
 CMD ["bash"]
+
+
 
 
 
