@@ -94,7 +94,7 @@ class GapAndEmergencyAvoidNode(object):
 
         # 멀리 보는 gap 기준
         self.free_dist      = rospy.get_param("~free_dist", 0.8)      # 100cm
-        self.fov_deg        = rospy.get_param("~fov_deg", 110.0)      # 전방 ±60도
+        self.fov_deg        = rospy.get_param("~fov_deg", 120.0)      # 전방 ±60도
         self.linear_speed   = rospy.get_param("~linear_speed", 0.20)  # 평상시 전진 속도
         self.k_ang          = rospy.get_param("~k_ang", 1.0)          # gap 조향 gain
         self.max_yaw        = rospy.get_param("~max_yaw", 1.0)        # 최대 조향 속도
@@ -102,7 +102,7 @@ class GapAndEmergencyAvoidNode(object):
         # 30cm 안 emergency 회피 기준
         self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)  # 30cm
         self.min_dist_back  = rospy.get_param("~min_dist_back", 0.14)   # 이 이하면 뒤로
-        self.scan_degree    = rospy.get_param("~scan_degree", 55.0)     # ±scan_degree 내만 근접장애물 판단
+        self.scan_degree    = rospy.get_param("~scan_degree", 65.0)     # ±scan_degree 내만 근접장애물 판단
 
         self.default_speed   = self.linear_speed
         self.backward_speed  = rospy.get_param("~backward_speed", 0.15)
