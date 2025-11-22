@@ -1,372 +1,296 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import math, numpy as np
+
+import math
 import rospy
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool   # ★ 추가: enable 게이팅용
+from std_msgs.msg import Float32, Bool
 
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+# ---------------- 공통 유틸 ----------------
+
+def sanitize_range(r, range_max):
+    """NaN / inf / 0 / 음수 → range_max 로 보정"""
+    if r is None:
+        return range_max
+    if r != r:                # NaN 체크
+        return range_max
+    if r <= 0.01 or math.isinf(r):
+        return range_max
+    return r
 
 
-# ============================================================
-# tf 없이 쓰는 euler_from_quaternion
-# 입력: [x, y, z, w]
-# 출력: (roll, pitch, yaw)
-# ============================================================
-def euler_from_quaternion(quat):
-    x, y, z, w = quat
+def find_longest_free_gap_angle(msg, min_dist=1.0, fov_deg=120.0):
+    """
+    LaserScan에서 전방 fov_deg 범위 안에서
+    min_dist(m) 이상 떨어진 구간들 중
+    가장 길게 연속된 구간(gap)의 중심 각도(rad, ROS 기준: 왼쪽 +) 리턴
 
-    # roll (x축)
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(t0, t1)
+    여기서 min_dist = 1.0 → "100cm 앞까지 빈공간" 기준
+    """
+    half = math.radians(fov_deg / 2.0)
+    n = len(msg.ranges)
 
-    # pitch (y축)
-    t2 = +2.0 * (w * y - z * x)
-    if t2 > 1.0:
-        t2 = 1.0
-    if t2 < -1.0:
-        t2 = -1.0
-    pitch = math.asin(t2)
+    best_start = None
+    best_len = 0
+    cur_start = None
 
-    # yaw (z축)
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(t3, t4)
+    for i in range(n):
+        angle = msg.angle_min + i * msg.angle_increment
 
-    return roll, pitch, yaw
+        # FOV 밖이면 gap 끊기
+        if angle < -half or angle > half:
+            if cur_start is not None:
+                cur_len = i - cur_start
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+                cur_start = None
+            continue
+
+        r = sanitize_range(msg.ranges[i], msg.range_max)
+        safe = r > min_dist  # 1m 이상이면 "멀리까지 빈공간"
+
+        if safe:
+            if cur_start is None:
+                cur_start = i
+        else:
+            if cur_start is not None:
+                cur_len = i - cur_start
+                if cur_len > best_len:
+                    best_len = cur_len
+                    best_start = cur_start
+                cur_start = None
+
+    # 마지막까지 이어진 gap 처리
+    if cur_start is not None:
+        cur_len = n - cur_start
+        if cur_len > best_len:
+            best_len = cur_len
+            best_start = cur_start
+
+    # 안전 구간 없음 → 정면 0
+    if best_start is None or best_len == 0:
+        return 0.0
+
+    center_idx = best_start + best_len // 2
+    center_angle = msg.angle_min + center_idx * msg.angle_increment
+    return center_angle  # ROS 기준: 왼쪽 +, 오른쪽 -
 
 
-class DWAObstacleAvoid:
+# ---------------- 메인 클래스 ----------------
+
+class GapAndEmergencyAvoidNode(object):
     def __init__(self):
+        rospy.init_node("obstacle_avoid")
 
-        # ===== ROS Param =====
-        self.frame_rate      = rospy.get_param("~rate", 15)
-        self.dt              = rospy.get_param("~dt", 0.1)
-        self.predict_time    = rospy.get_param("~predict_time", 1.4)
+        # ===== 파라미터 =====
+        # 토픽 이름들
+        self.scan_topic    = rospy.get_param("~scan_topic", "/scan")
+        self.cmd_topic     = rospy.get_param("~cmd_topic", "/cmd_vel_obstacle")
+        self.enable_topic  = rospy.get_param("~enable_topic", "/obstacle_enable")
+        self.debug_deg_topic = rospy.get_param("~debug_deg_topic", "/free_gap_angle_deg")
 
-        # 속도 및 제한
-        self.max_speed       = rospy.get_param("~max_speed", 0.8)
-        self.min_speed       = rospy.get_param("~min_speed", -0.08)
-        self.max_yawrate     = rospy.get_param("~max_yawrate", 1.5)
-        self.max_accel       = rospy.get_param("~max_accel", 1.2)
-        self.max_dyawrate    = rospy.get_param("~max_dyawrate", 3.0)
+        # 멀리 보는 gap 기준
+        self.free_dist      = rospy.get_param("~free_dist", 1.0)      # 100cm
+        self.fov_deg        = rospy.get_param("~fov_deg", 120.0)      # 전방 ±60도
+        self.linear_speed   = rospy.get_param("~linear_speed", 0.20)  # 평상시 전진 속도
+        self.k_ang          = rospy.get_param("~k_ang", 1.0)          # gap 조향 gain
+        self.max_yaw        = rospy.get_param("~max_yaw", 1.0)        # 최대 조향 속도
 
-        # 샘플 resolution
-        self.v_reso          = rospy.get_param("~v_reso", 0.03)
-        self.yawrate_reso    = rospy.get_param("~yawrate_reso", 0.15)
+        # 30cm 안 emergency 회피 기준
+        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)  # 30cm
+        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.20)   # 이 이하면 뒤로
+        self.scan_degree    = rospy.get_param("~scan_degree", 60.0)     # ±scan_degree 내만 근접장애물 판단
 
-        # 로봇 크기
-        self.robot_radius    = rospy.get_param("~robot_radius", 0.16)
-        self.obst_margin     = rospy.get_param("~obstacle_margin", 0.05)
+        self.default_speed   = self.linear_speed
+        self.backward_speed  = rospy.get_param("~backward_speed", 0.15)
 
-        # 안전 Dist
-        self.stop_clearance  = rospy.get_param("~stop_clearance", 0.14)
-        self.slow_clearance  = rospy.get_param("~slow_clearance", 0.22)
-        self.gap_clearance   = rospy.get_param("~gap_clearance", 0.50)   # 50cm 기준
+        # LiDAR 관련 상태
+        self.lidar_flag      = False
+        self.degrees         = []
+        self.ranges_length   = 0
+        self.dist_data       = 999.0
+        self.obstacle_ranges = []
+        self.direction       = "front"  # front / right / left / right_back / left_back / back
 
-        # FTG ROI
-        self.front_roi_deg   = rospy.get_param("~front_roi_deg", 120)
+        # enable (FSM에서 /obstacle_enable 들어옴)
+        self.enabled         = True
 
-        # Cost
-        self.w_heading       = rospy.get_param("~w_heading",    1.9)
-        self.w_clearance     = rospy.get_param("~w_clearance",  0.9)
-        self.w_velocity      = rospy.get_param("~w_velocity",   1.0)
-        self.w_smooth        = rospy.get_param("~w_smooth",     0.25)
+        # 퍼블리셔
+        self.cmd_pub         = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
+        self.debug_deg_pub   = rospy.Publisher(self.debug_deg_topic, Float32, queue_size=1)
 
-        # 후진 패널티
-        self.backward_penalty = rospy.get_param("~backward_penalty", 3.0)
+        # 서브스크라이버
+        rospy.Subscriber(self.scan_topic, LaserScan, self.scan_cb, queue_size=1)
+        rospy.Subscriber(self.enable_topic, Bool, self.enable_cb, queue_size=1)
 
-        # Internal states
-        self.has_scan = False
-        self.has_odom = False
-        self.scan_angles = None
-        self.scan_pts = None
-        self.ranges = None
+        rospy.loginfo("GapAndEmergencyAvoidNode started.")
+        rospy.loginfo("  scan_topic=%s, cmd_topic=%s, enable_topic=%s",
+                      self.scan_topic, self.cmd_topic, self.enable_topic)
 
-        self.x = self.y = self.yaw = 0.0
-        self.vx = self.wz = 0.0
-
-        # ★ enable 플래그
-        self.enabled = True  # FSM 없으면 기본 True로 단독 테스트 가능
-
-        # ROS IO (토픽 이름은 파라미터로도 바꿀 수 있게)
-        scan_topic   = rospy.get_param("~scan_topic", "/scan")
-        odom_topic   = rospy.get_param("~odom_topic", "/odom")
-        cmd_topic    = rospy.get_param("~cmd_topic", "/cmd_vel_obstacle")  # ★ FSM용 출력
-        enable_topic = rospy.get_param("~enable_topic", "/obstacle_enable")  # ★ 게이팅
-
-        rospy.Subscriber(scan_topic, LaserScan, self.cb_scan, queue_size=1)
-        rospy.Subscriber(odom_topic, Odometry, self.cb_odom, queue_size=1)
-        rospy.Subscriber(enable_topic, Bool, self.cb_enable, queue_size=1)  # ★ enable 구독
-        self.pub_cmd = rospy.Publisher(cmd_topic, Twist, queue_size=1)
-
-    # =====================
-    #    Callbacks
-    # =====================
-
-    def cb_scan(self, msg: LaserScan):
-        n = len(msg.ranges)
-        angles = msg.angle_min + np.arange(n) * msg.angle_increment
-        ranges = np.array(msg.ranges, dtype=np.float32)
-
-        ranges = np.where(
-            np.isfinite(ranges) & (ranges > 0.01),
-            ranges,
-            msg.range_max
-        )
-
-        xs = ranges * np.cos(angles)
-        ys = ranges * np.sin(angles)
-
-        self.scan_pts = np.stack([xs, ys], axis=1)
-        self.scan_angles = angles
-        self.ranges = ranges
-        self.has_scan = True
-
-    def cb_odom(self, msg: Odometry):
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-
-        self.x, self.y = p.x, p.y
-        # ★ 여기서 우리가 만든 euler_from_quaternion 사용
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.yaw = yaw
-
-        self.vx = msg.twist.twist.linear.x
-        self.wz = msg.twist.twist.angular.z
-        self.has_odom = True
-
-    def cb_enable(self, msg: Bool):
-        # ★ FSM에서 /obstacle_enable 들어옴
+    def enable_cb(self, msg: Bool):
+        """
+        FSM MUX 에서 오는 /obstacle_enable 신호
+        True  → 연산/회피 활성
+        False → 이 노드 계산 스킵 (CPU 아낌)
+        """
         self.enabled = msg.data
 
-    # ========================================
-    # FTG 기반 GAP 헤딩 (조향 방향)
-    # ========================================
-    def compute_gap_heading(self):
-        if self.ranges is None:
-            return 0.0
+    # ---------- 네가 준 LiDAR_scan 로직 정리 버전 ----------
+    def LiDAR_scan(self, l_msg):
+        obstacle_idx = []
 
-        half = math.radians(self.front_roi_deg / 2.0)
-        mask = (self.scan_angles > -half) & (self.scan_angles < half)
+        # 최초 1회 각도 테이블 생성 (deg)
+        if not self.lidar_flag:
+            self.degrees = [
+                (l_msg.angle_min + i * l_msg.angle_increment) * 180.0 / math.pi
+                for i in range(len(l_msg.ranges))
+            ]
+            self.ranges_length = len(l_msg.ranges)
+            self.lidar_flag = True
 
-        ang = self.scan_angles[mask]
-        dist = self.ranges[mask]
+        # 근접 장애물 찾기 (0 < data < emergency_dist, ±scan_degree 안)
+        min_obstacle_dist = l_msg.range_max
 
-        thresh = self.gap_clearance
-        safe = dist > thresh
+        for i, data in enumerate(l_msg.ranges):
+            if 0.0 < data < self.emergency_dist and \
+               -self.scan_degree < self.degrees[i] < self.scan_degree:
+                obstacle_idx.append(i)
+                # 가장 가까운 장애물 거리 기록
+                if data < min_obstacle_dist:
+                    min_obstacle_dist = data
 
-        if not np.any(safe):
-            return 0.0
+        has_obstacle = False
+        first = first_dst = last = last_dst = 0
 
-        idx = np.where(safe)[0]
-        gaps = np.split(idx, np.where(np.diff(idx) != 1)[0] + 1)
-        best_gap = max(gaps, key=len)
-        a_center = ang[best_gap[len(best_gap)//2]]
+        if obstacle_idx:
+            has_obstacle = True
+            first = obstacle_idx[0]
+            first_dst = first
+            last = obstacle_idx[-1]
+            last_dst = self.ranges_length - last
+            self.obstacle_ranges = l_msg.ranges[first:last + 1]
+            self.dist_data = min_obstacle_dist
+        else:
+            self.obstacle_ranges = []
+            self.dist_data = l_msg.range_max
 
-        return float(a_center)
+        return first, first_dst, last, last_dst, has_obstacle
 
-    # ========================================
-    #    Pre-Steering: 미리 조향하게 하는 핵심
-    # ========================================
-    def front_min_clearance(self, width_deg=60):
-        if self.ranges is None:
-            return 10.0
+    # ---------- 방향 결정 ----------
+    def decide_direction(self, first_dst, last_dst, has_obstacle):
+        if has_obstacle:
+            # first_dst > last_dst → 오른쪽으로 공간 많다 → 오른쪽으로 회피
+            if first_dst > last_dst and self.dist_data > self.min_dist_back:
+                self.direction = "right"
+            elif first_dst < last_dst and self.dist_data > self.min_dist_back:
+                self.direction = "left"
+            # 너무 가까우면 뒤로 + 회피
+            elif first_dst > last_dst and self.dist_data <= self.min_dist_back:
+                self.direction = "right_back"
+            elif first_dst < last_dst and self.dist_data <= self.min_dist_back:
+                self.direction = "left_back"
+        else:
+            self.direction = "front"
 
-        half = math.radians(width_deg / 2)
-        mask = (self.scan_angles > -half) & (self.scan_angles < half)
+    # ---------- direction 에 따라 Twist 생성 ----------
+    def make_cmd_from_direction(self, free_gap_angle_ros):
+        """
+        free_gap_angle_ros : 멀리(1m) 기준으로 찾은 gap 각도(rad, 왼쪽+)
+        self.direction     : LiDAR_scan + decide_direction 에서 결정된 값
+        """
+        cmd = Twist()
 
-        if not np.any(mask):
-            return 10.0
+        if self.direction == "front":
+            # ☆ 정상 모드: 1m 기준 가장 긴 gap 방향으로 전진
+            ang_z = self.k_ang * free_gap_angle_ros
+            if ang_z > self.max_yaw:
+                ang_z = self.max_yaw
+            elif ang_z < -self.max_yaw:
+                ang_z = -self.max_yaw
 
-        return float(np.min(self.ranges[mask]))
+            cmd.linear.x = self.default_speed
+            cmd.angular.z = ang_z
 
-    # ========================================
-    # DWA Core
-    # ========================================
-    def dynamic_window(self):
-        vs_min = max(self.min_speed, self.vx - self.max_accel * self.dt)
-        vs_max = min(self.max_speed, self.vx + self.max_accel * self.dt)
-        ws_min = self.wz - self.max_dyawrate * self.dt
-        ws_max = self.wz + self.max_dyawrate * self.dt
-        return vs_min, vs_max, ws_min, ws_max
+        elif self.direction == "right":
+            # 오른쪽으로 회피 (ROS 기준 오른쪽은 -)
+            cmd.linear.x = self.default_speed * 0.5
+            cmd.angular.z = -self.max_yaw * 0.7
 
-    def simulate(self, v, w):
-        x = y = yaw = 0.0
-        path = []
-        t = 0.0
-        while t < self.predict_time:
-            x += v * math.cos(yaw) * self.dt
-            y += v * math.sin(yaw) * self.dt
-            yaw += w * self.dt
-            path.append((x, y, yaw))
-            t += self.dt
-        return path
+        elif self.direction == "left":
+            # 왼쪽으로 회피
+            cmd.linear.x = self.default_speed * 0.5
+            cmd.angular.z = self.max_yaw * 0.7
 
-    def clearance_along_path(self, path):
-        if self.scan_pts is None:
-            return 10.0
+        elif self.direction == "right_back":
+            # 오른쪽으로 돌면서 후진
+            cmd.linear.x = -self.backward_speed
+            cmd.angular.z = -self.max_yaw * 0.7
 
-        pts = self.scan_pts
-        rad = self.robot_radius + self.obst_margin
-        min_clear = 10.0
+        elif self.direction == "left_back":
+            # 왼쪽으로 돌면서 후진
+            cmd.linear.x = -self.backward_speed
+            cmd.angular.z = self.max_yaw * 0.7
 
-        for x, y, yaw in path:
-            c = math.cos(-yaw)
-            s = math.sin(-yaw)
+        elif self.direction == "back":
+            # 그냥 직진 후진 (필요하면 사용)
+            cmd.linear.x = -self.backward_speed
+            cmd.angular.z = 0.0
 
-            px = pts[:, 0] - x
-            py = pts[:, 1] - y
+        else:
+            # 안전빵: 멈춤
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
 
-            rx = c * px - s * py
-            ry = s * px + c * py
+        return cmd
 
-            d2 = rx*rx + ry*ry
-            if len(d2) == 0:
-                continue
+    # ---------- 메인 콜백 ----------
+    def scan_cb(self, msg: LaserScan):
+        # FSM에서 obstacle_disable 이면 그냥 정지 명령만 보내고 계산 스킵해도 됨
+        if not self.enabled:
+            # 필요하면 여기서 아예 0 cmd를 계속 보내고 싶으면 주석 해제
+            # cmd = Twist()
+            # self.cmd_pub.publish(cmd)
+            return
 
-            m = float(np.sqrt(d2.min()))
-            if m < min_clear:
-                min_clear = m
-
-            if min_clear <= rad:
-                return min_clear
-
-        return min_clear
-
-    def eval_traj(self, v, w, th_goal):
-        path = self.simulate(v, w)
-        clear = self.clearance_along_path(path)
-
-        xf, yf, yawf = path[-1]
-        head_err = abs(self.norm_angle(yawf - th_goal))
-
-        cost = (
-            self.w_heading    * head_err
-            - self.w_clearance * clear
-            - self.w_velocity  * v
-            + self.w_smooth    * abs(w - self.wz)
+        # 1) 100cm 기준 가장 긴 빈공간 각도 찾기 (멀리용)
+        free_angle_ros = find_longest_free_gap_angle(
+            msg,
+            min_dist=self.free_dist,   # 1.0m
+            fov_deg=self.fov_deg
         )
 
-        if v < 0:
-            cost += self.backward_penalty
+        # 2) 30cm 안 근접 장애물 스캔
+        first, first_dst, last, last_dst, has_obstacle = self.LiDAR_scan(msg)
 
-        return cost, clear
+        # 3) 근접 장애물이 있으면 direction 결정 / 없으면 front
+        self.decide_direction(first_dst, last_dst, has_obstacle)
 
-    @staticmethod
-    def norm_angle(a):
-        while a > math.pi:
-            a -= 2*math.pi
-        while a < -math.pi:
-            a += 2*math.pi
-        return a
+        # 4) 디버그: 네가 원하는 기준(정면0, 오른쪽+, 왼쪽-) 각도 publish
+        deg_ros = free_angle_ros * 180.0 / math.pi    # ROS: 왼쪽+
+        deg_user = -deg_ros                           # USER: 오른쪽+
+        if deg_user > 60.0:
+            deg_user = 60.0
+        elif deg_user < -60.0:
+            deg_user = -60.0
 
-    # ========================================
-    # pick_control()
-    # ========================================
-    def pick_control(self):
+        dbg = Float32()
+        dbg.data = deg_user
+        self.debug_deg_pub.publish(dbg)
 
-        th_goal = self.compute_gap_heading()
-        vs_min, vs_max, ws_min, ws_max = self.dynamic_window()
+        rospy.loginfo("dir=%s, free_gap=ROS %.1fdeg (left+), USER %.1fdeg (right+), dist_data=%.3f",
+                      self.direction, deg_ros, deg_user, self.dist_data)
 
-        best_cost = float("inf")
-        best_v = 0.0
-        best_w = 0.0
-        best_clr = 0.0
-
-        v = vs_min
-        while v <= vs_max + 1e-9:
-            w = ws_min
-            while w <= ws_max + 1e-9:
-                cost, clr = self.eval_traj(v, w, th_goal)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_v = v
-                    best_w = w
-                    best_clr = clr
-                w += self.yawrate_reso
-            v += self.v_reso
-
-        v_cmd = best_v
-        w_cmd = best_w
-        clr   = best_clr
-
-        # ======================================================
-        #   🔥 Pre-Steering Layer (조향을 더 빨리 시작)
-        # ======================================================
-        front_clr = self.front_min_clearance(width_deg=60)
-        PRE_STEER_DIST = 0.45      # 이 거리 안에서 서서히 조향
-        if front_clr < PRE_STEER_DIST:
-            alpha = (PRE_STEER_DIST - front_clr) / PRE_STEER_DIST
-            alpha = clamp(alpha, 0.0, 1.0)
-
-            desired_w = clamp(th_goal * 1.6,
-                               -self.max_yawrate, self.max_yawrate)
-
-            w_cmd = (1.0 - alpha) * w_cmd + alpha * desired_w
-            v_cmd = min(v_cmd, self.max_speed * (1.0 - 0.4 * alpha))
-
-        # ======================================================
-        #   기존 안전 정책 (정지/감속)
-        # ======================================================
-        if clr < self.stop_clearance:
-            if v_cmd > 0:
-                v_cmd = 0.0
-            w_cmd = clamp(th_goal * 1.8,
-                          -self.max_yawrate, self.max_yawrate)
-
-        elif clr < self.slow_clearance:
-            v_cmd = min(v_cmd, 0.25)
-
-        # 최종 클램프 — 후진 포함
-        v_cmd = clamp(v_cmd, self.min_speed, self.max_speed)
-        w_cmd = clamp(w_cmd, -self.max_yawrate, self.max_yawrate)
-
-        return v_cmd, w_cmd
-
-    def publish(self, v, w):
-        msg = Twist()
-        msg.linear.x  = float(v)
-        msg.angular.z = float(w)
-        self.pub_cmd.publish(msg)
-
-    def spin(self):
-        rate = rospy.Rate(self.frame_rate)
-        rospy.loginfo("[Mission3][DWA] started.")
-        idle_cnt = 0
-
-        while not rospy.is_shutdown():
-
-            # ★ 게이팅: obstacle_enable == False 이면 연산 싹 스킵 + 정지 명령
-            if not self.enabled:
-                self.publish(0.0, 0.0)
-                rate.sleep()
-                continue
-
-            if not (self.has_scan and self.has_odom):
-                self.publish(0.0, 0.0)
-                idle_cnt += 1
-                if idle_cnt % (self.frame_rate*3) == 0:
-                    rospy.logwarn("Waiting scan/odom...")
-                rate.sleep()
-                continue
-
-            try:
-                v, w = self.pick_control()
-                self.publish(v, w)
-            except Exception as e:
-                rospy.logerr("DWA error: %s", str(e))
-                self.publish(0.0, 0.0)
-
-            rate.sleep()
+        # 5) direction + free_gap_angle 로 최종 cmd_vel 생성
+        cmd = self.make_cmd_from_direction(free_angle_ros)
+        self.cmd_pub.publish(cmd)
 
 
 if __name__ == "__main__":
-    rospy.init_node("mission3_dwa")
-    node = DWAObstacleAvoid()
-    node.spin()
+    try:
+        node = GapAndEmergencyAvoidNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
