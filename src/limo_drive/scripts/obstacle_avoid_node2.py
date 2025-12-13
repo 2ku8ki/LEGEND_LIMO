@@ -138,37 +138,35 @@ def find_longest_free_gap_angle(msg,
 
 # ---------------- 메인 클래스 ----------------
 
-class GapAndEmergencyAvoidNode(object):
+class Limo_obstacle_avoidence:
     def __init__(self):
-        rospy.init_node("obstacle_avoid")
+        rospy.init_node("base_obstacle_avoid")
 
-        # ===== 파라미터 =====
-        # 토픽 이름들
+        # ===== 토픽/게이팅 =====
         self.scan_topic      = rospy.get_param("~scan_topic", "/scan")
         self.cmd_topic       = rospy.get_param("~cmd_topic", "/cmd_vel_obstacle")
         self.enable_topic    = rospy.get_param("~enable_topic", "/obstacle_enable")
         self.debug_deg_topic = rospy.get_param("~debug_deg_topic", "/free_gap_angle_deg")
 
-        # 멀리 gap 기준
-        self.free_dist      = rospy.get_param("~free_dist", 0.7)      # 100cm 근처
-        self.fov_deg        = rospy.get_param("~fov_deg", 150.0)      # 전방 ±75도
-        self.linear_speed   = rospy.get_param("~linear_speed", 0.20)  # 평상시 전진 속도
-        self.k_ang          = rospy.get_param("~k_ang", 1.0)          # gap 조향 gain
-        self.max_yaw        = rospy.get_param("~max_yaw", 1.0)        # 최대 조향 속도
-
-        # gap 폭 조건 (m 단위)
+        # ===== gap 기반 주행 파라미터 =====
+        self.free_dist      = rospy.get_param("~free_dist", 0.7)
+        self.fov_deg        = rospy.get_param("~fov_deg", 150.0)
+        self.linear_speed   = rospy.get_param("~linear_speed", 0.20)
+        self.k_ang          = rospy.get_param("~k_ang", 1.0)
+        self.max_yaw        = rospy.get_param("~max_yaw", 1.0)
         self.min_gap_width_m = rospy.get_param("~min_gap_width_m", 0.20)
         self.max_gap_width_m = rospy.get_param("~max_gap_width_m", 0.60)
 
-        # 근접 emergency 기준
-        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)  # 30cm
-        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.15)   # 이 이하면 뒤로
-        self.scan_degree    = rospy.get_param("~scan_degree", 60.0)     # ±scan_degree 내만 근접장애물 판단
+        # ===== 이머전시(근접) 파라미터 =====
+        # (아래 로직은 1번 코드의 LiDAR_scan/decide_direction에서 그대로 사용)
+        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)
+        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.15)
+        self.scan_degree    = rospy.get_param("~scan_degree", 60.0)
 
-        self.default_speed   = self.linear_speed
-        self.backward_speed  = rospy.get_param("~backward_speed", 0.15)
+        self.default_speed  = self.linear_speed
+        self.backward_speed = rospy.get_param("~backward_speed", 0.15)
 
-        # LiDAR 상태
+        # ===== LiDAR 상태 =====
         self.lidar_flag      = False
         self.degrees         = []
         self.ranges_length   = 0
@@ -176,25 +174,22 @@ class GapAndEmergencyAvoidNode(object):
         self.obstacle_ranges = []
         self.direction       = "front"  # front / right / left / right_back / left_back / back
 
-        # 마지막으로 선택된 gap 폭 (조향 여부 판별용)
+        # 마지막으로 선택된 gap 폭
         self.last_chosen_width = 0.0
 
-        # enable (FSM에서 /obstacle_enable 들어옴)
+        # enable (FSM)
         self.enabled = True
 
-        # 퍼블리셔 / 서브스크라이버
+        # pub/sub
         self.cmd_pub       = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
         self.debug_deg_pub = rospy.Publisher(self.debug_deg_topic, Float32, queue_size=1)
 
         rospy.Subscriber(self.scan_topic,   LaserScan, self.scan_cb,   queue_size=1)
         rospy.Subscriber(self.enable_topic, Bool,       self.enable_cb, queue_size=1)
 
-        rospy.loginfo("GapAndEmergencyAvoidNode started.")
+        rospy.loginfo("base_obstacle_avoid started.")
         rospy.loginfo("  scan_topic=%s, cmd_topic=%s, enable_topic=%s",
                       self.scan_topic, self.cmd_topic, self.enable_topic)
-        rospy.loginfo("  free_dist=%.2f, fov=%.1fdeg, gap_width=[%.2f, %.2f] m",
-                      self.free_dist, self.fov_deg,
-                      self.min_gap_width_m, self.max_gap_width_m)
 
     # ---------- enable 콜백 ----------
     def enable_cb(self, msg: Bool):
@@ -205,7 +200,15 @@ class GapAndEmergencyAvoidNode(object):
         """
         self.enabled = msg.data
 
+        # 꺼질 때는 한 번 0 명령을 보내서 FSM의 last_obstacle_cmd 도 0으로 덮어줌
+        if not self.enabled:
+            z = Twist()
+            z.linear.x = 0.0
+            z.angular.z = 0.0
+            self.cmd_pub.publish(z)
+
     # ---------- LiDAR_scan: 근접 장애물 ----------
+    # ★★★★★ 여기부터 이머전시 로직: 1번 코드 그대로 (변경 금지) ★★★★★
     def LiDAR_scan(self, l_msg):
         obstacle_idx = []
 
@@ -260,6 +263,7 @@ class GapAndEmergencyAvoidNode(object):
                 self.direction = "left_back"
         else:
             self.direction = "front"
+    # ★★★★★ 여기까지 이머전시 로직: 1번 코드 그대로 (변경 금지) ★★★★★
 
     # ---------- direction 에 따라 Twist 생성 ----------
     def make_cmd_from_direction(self, free_gap_angle_ros):
@@ -332,26 +336,14 @@ class GapAndEmergencyAvoidNode(object):
 
         self.last_chosen_width = chosen_width_m
 
-        # 2) 근접 장애물 스캔
+        # 2) 근접 장애물 스캔 (이머전시)
         first, first_dst, last, last_dst, has_obstacle = self.LiDAR_scan(msg)
 
-        # 3) direction 결정
+        # 3) direction 결정 (이머전시)
         self.decide_direction(first_dst, last_dst, has_obstacle)
 
-        # 4) 디버그: 각도/폭
-        deg_ros_chosen   = free_angle_ros * 180.0 / math.pi
-        deg_ros_longest  = longest_center_ros * 180.0 / math.pi
-
-        rospy.loginfo(
-            "dir=%s | chosen_gap: center=%.1fdeg(ROS,left+), width=%.2fm | "
-            "longest_gap: center=%.1fdeg(ROS), width=%.2fm | dist_data=%.3f",
-            self.direction,
-            deg_ros_chosen, chosen_width_m,
-            deg_ros_longest, longest_width_m,
-            self.dist_data
-        )
-
-        # 디버그용 degree (사용자 기준: 오른쪽 +, 왼쪽 -)
+        # 4) 디버그: 각도(사용자 기준 오른쪽+)
+        deg_ros_chosen  = free_angle_ros * 180.0 / math.pi
         deg_user = -deg_ros_chosen
         if deg_user > 60.0:
             deg_user_clamped = 60.0
@@ -364,15 +356,14 @@ class GapAndEmergencyAvoidNode(object):
         dbg.data = deg_user_clamped
         self.debug_deg_pub.publish(dbg)
 
-        # 5) 최종 cmd_vel_obstacle publish (FSM MUX에서 사용)
+        # 5) 최종 cmd publish
         cmd = self.make_cmd_from_direction(free_angle_ros)
         self.cmd_pub.publish(cmd)
 
 
 if __name__ == "__main__":
     try:
-        node = GapAndEmergencyAvoidNode()
+        node = Limo_obstacle_avoidence()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
-
