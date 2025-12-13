@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- LKAS -->
+  <node pkg="limo_drive"
+        type="lkas_node.py"
+        name="lkas"
+        output="screen" />
+
+  <!-- Detect (obstacle_state) -->
+  <node pkg="limo_drive"
+        type="obstacle_detect_node.py"
+        name="obstacle_detect"
+        output="screen" />
+
+  <!-- base obstacle_avoid (short distance greedy avoid) -->
+  <node pkg="limo_drive"
+        type="base_obstacle_avoid_node.py"
+        name="base_obstacle_avoid"
+        output="screen">
+    <!-- LiDAR 입력 -->
+    <param name="scan_topic"   value="/scan" />
+    <!-- FSM이 평소에 받아 쓸 회피 cmd -->
+    <param name="cmd_topic"    value="/cmd_vel_obstacle" />
+    <!-- 필요하면 enable 게이팅도 여기서 (예: /obstacle_enable) -->
+    <!-- <param name="enable_topic" value="/obstacle_enable" /> -->
+  </node>
+
+  <!-- mission3 노드 (long distance greedy DWA) -->
+  <node pkg="limo_drive"
+        type="mission3_node.py"
+        name="mission3_dwa"
+        output="screen">
+    <!-- 동일하게 LiDAR + odom -->
+    <param name="scan_topic"   value="/scan" />
+    <param name="odom_topic"   value="/odom" />
+    <!-- 미션3 전용 cmd 토픽 (FSM이 미션3 구간에서만 사용) -->
+    <param name="cmd_topic"    value="/cmd_vel_obstacle_m3" />
+    <!-- FSM에서 미션3 구간에만 True로 올려줄 enable -->
+    <param name="enable_topic" value="/mission3_enable" />
+  </node>
+
+  <!-- FSM / MUX -->
+  <node pkg="limo_drive"
+        type="fsm_mux_node3.py"
+        name="fsm_mux"
+        output="screen" />
+</launch>
+
