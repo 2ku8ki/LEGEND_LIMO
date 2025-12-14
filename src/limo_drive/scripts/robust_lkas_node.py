@@ -164,7 +164,7 @@ class LKAS:
         bw[:, left_end:right_start] = 0
 
         # 4) "세로로 긴 성분" 강조 (차선=세로로 길고, 횡단보도/숫자=가로/덩어리 성분)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 15))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 20))
         bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)   # 작은 덩어리 제거
         bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)  # 끊긴 세로선 연결(약하게)
 
