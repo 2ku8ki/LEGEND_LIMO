@@ -51,7 +51,7 @@ class LKAS:
         # warp 관련 기본값
         self.img_x = 0
         self.img_y = 0
-        self.offset_x = 40  # BEV에서 좌우 여유. 필요하면 조절
+        self.offset_x = 20  # BEV에서 좌우 여유. 필요하면 조절
 
         self.enabled = True   # 기본값: FSM 없이 단독 돌릴 때도 동작하도록
         rospy.Subscriber("/lkas_enable", Bool, self.enable_cb, queue_size=1)
@@ -154,17 +154,17 @@ class LKAS:
 
         # 2) 너무 먼 앞(상단) 제거 -> "앞을 너무 봐서 생기는 오검출" 감소
         #    값 올릴수록 더 가까운 영역만 봄 (0.40~0.70 사이에서 튜닝)
-        top_cut = int(h * 0.40)   # 예: 상단 50% 버림 → 하단 50%만 사용
+        top_cut = int(h * 0.30)   # 예: 상단 50% 버림 → 하단 50%만 사용
         bw[:top_cut, :] = 0
 
         # 3) 중앙 제거 + 양쪽만 살리기 (숫자/문자 등 중앙 마킹 대부분 컷)
         #    도로/카메라에 따라 튜닝 (left_end 0.35~0.50 / right_start 0.50~0.65)
-        left_end = int(w * 0.4)
-        right_start = int(w * 0.6)
+        left_end = int(w * 0.35)
+        right_start = int(w * 0.65)
         bw[:, left_end:right_start] = 0
 
         # 4) "세로로 긴 성분" 강조 (차선=세로로 길고, 횡단보도/숫자=가로/덩어리 성분)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 25))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 15))
         bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)   # 작은 덩어리 제거
         bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)  # 끊긴 세로선 연결(약하게)
 
