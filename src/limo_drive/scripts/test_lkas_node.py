@@ -91,7 +91,7 @@ class LKAS:
         self.img_x, self.img_y = img.shape[1], img.shape[0]
 
         # src는 원본 이미지 상에서의 포인트 (사다리꼴)
-        src_center_offset = [100, 158]
+        src_center_offset = [50, 158]
         src = np.array(
             [
                 [0, self.img_y - 1],
