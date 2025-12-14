@@ -214,7 +214,7 @@ class Limo_obstacle_avoidence:
 
         # ===== gap 기반 주행 파라미터 =====
         self.free_dist      = rospy.get_param("~free_dist", 0.7)
-        self.fov_deg        = rospy.get_param("~fov_deg", 40.0)
+        self.fov_deg        = rospy.get_param("~fov_deg", 30.0)
         self.linear_speed   = rospy.get_param("~linear_speed", 0.3)
         self.k_ang          = rospy.get_param("~k_ang", 1.0)
         self.max_yaw        = rospy.get_param("~max_yaw", 1.0)
@@ -223,7 +223,7 @@ class Limo_obstacle_avoidence:
 
         # ===== 이머전시(근접) 파라미터 =====
         # (아래 로직은 1번 코드의 LiDAR_scan/decide_direction에서 그대로 사용)
-        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)
+        self.emergency_dist = rospy.get_param("~emergency_dist", 0.23)
         self.min_dist_back  = rospy.get_param("~min_dist_back", 0.17)
         self.scan_degree    = rospy.get_param("~scan_degree", 60.0)
 
