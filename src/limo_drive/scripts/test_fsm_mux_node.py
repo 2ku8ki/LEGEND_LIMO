@@ -70,7 +70,7 @@ class FSMMuxNode:
         self.loop_rate = rospy.get_param("~loop_rate", 30.0)
 
         # ----- Mission3 / V2X 타이밍 파라미터 -----
-        self.m3_phase_time          = rospy.get_param("~m3_phase_time", 36)   # 첫 LKAS cmd 이후 기준
+        self.m3_phase_time          = rospy.get_param("~m3_phase_time", 26)   # 첫 LKAS cmd 이후 기준
         self.m3_turn_duration       = rospy.get_param("~m3_turn_duration", 2.5)
         self.m3_turn_speed          = rospy.get_param("~m3_turn_speed", 0.18)
         self.m3_turn_yaw            = rospy.get_param("~m3_turn_yaw", -0.4)
@@ -81,10 +81,10 @@ class FSMMuxNode:
         self.m3_force_base_duration = rospy.get_param("~m3_force_base_duration", 7.0)
 
         # v2x
-        self.v2x_phase_time      = rospy.get_param("~v2x_phase_time", 16.0)
-        self.v2x_turn_duration   = rospy.get_param("~v2x_turn_duration", 3)
-        self.v2x_turn_speed      = rospy.get_param("~v2x_turn_speed", 0.15)
-        self.v2x_turn_yaw        = rospy.get_param("~v2x_turn_yaw", 0.12)
+        self.v2x_phase_time      = rospy.get_param("~v2x_phase_time", 12.0)
+        self.v2x_turn_duration   = rospy.get_param("~v2x_turn_duration", 2.5)
+        self.v2x_turn_speed      = rospy.get_param("~v2x_turn_speed", 0.18)
+        self.v2x_turn_yaw        = rospy.get_param("~v2x_turn_yaw", 0.4)
 
         # --- 상태 변수들 ---
         self.current_mode = DriveMode.LANE_FOLLOW
