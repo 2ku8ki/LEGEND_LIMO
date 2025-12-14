@@ -1,514 +1,458 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import rospy
-from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool, String
 from geometry_msgs.msg import Twist
-from cv_bridge import CvBridge
-from std_msgs.msg import Bool
+import enum
+import copy
 
 
-import numpy as np
-import cv2
-from math import atan
+class DriveMode(enum.Enum):
+    LANE_FOLLOW = 0
+    OBSTACLE_AVOID = 1
 
 
-class LKAS:
+class Mission3Phase(enum.Enum):
+    BEFORE = 0         # 아직 미션3 시퀀스 시작 전
+    TURNING = 1        # 고정 조향 구간
+    FORCE_OBS = 2      # mission3 DWA 강제 ON 구간
+    FORCE_BASE = 3     # base obstacle 강제 ON 구간
+    DONE = 4           # 미션3 시퀀스 끝
+
+
+class V2XPhase(enum.Enum):
+    WAIT_START = 0    # 아직 v2x 타이머 시작 전
+    COUNTING = 1      # v2x 타이머 증가 중
+    TURNING = 2       # v2x 고정 조향 구간 (1단계/2단계 공용 state)
+    DONE = 3          # v2x 시퀀스 끝
+
+
+class FSMMuxNode:
+    """
+    FSM + MUX 노드 + lab time 2개
+
+    입력:
+      - /obstacle_state        (Bool)          : 장애물 여부 (Detect 노드 출력, sta)
+      - /cmd_vel_lkas          (Twist)         : LKAS 노드 출력
+      - /cmd_vel_obstacle      (Twist)         : base obstacle 회피 노드 출력
+      - /cmd_vel_obstacle_m3   (Twist)         : mission3 DWA 노드 출력
+      - /path_                 (String) [선택] : V2X 모드 (A/B/C...), 일단 상태만 저장
+
+    출력:
+      - /cmd_vel               (Twist)         : 최종 속도 명령 (로봇에 들어가는 것)
+      - /drive_mode            (String)        : "LANE_FOLLOW" / "OBSTACLE_AVOID"
+      - /lkas_enable           (Bool)          : LKAS 연산 on/off 플래그
+      - /obstacle_enable       (Bool)          : base obstacle 연산 on/off 플래그
+      - /mission3_enable       (Bool)          : mission3 DWA 연산 on/off 플래그
+
+    추가 로직:
+      - lab_time_m3 : "첫 LKAS cmd 수신 시점" 부터 미션3 타이밍 제어
+      - lab_time_v2x: 미션3 끝난 뒤, obstacle 회피 끝난 시점부터 v2x 타이밍 제어
+    """
+
     def __init__(self):
-        # CvBridge
-        self.bridge = CvBridge()
-
-        # ROS node
-        rospy.init_node("LKAS_node")
-
-        # 디버그 이미지 publish (buffer 최소화)
-        self.pub = rospy.Publisher(
-            "/sliding_windows/compressed",
-            CompressedImage,
-            queue_size=1
-        )
-
-        # 카메라 subscribe (최신 프레임만 유지)
-        rospy.Subscriber(
-            "/camera/rgb/image_raw/compressed",
-            CompressedImage,
-            self.img_CB,
-            queue_size=1
-        )
-
-        # cmd_vel publisher
-        self.ctrl_pub = rospy.Publisher("/cmd_vel_lkas", Twist, queue_size=1)
-        self.speed = 0.25
-        self.trun_mutip = 0.14
-
-        # 상태 변수들
-        self.start_time = rospy.get_time()
-        self.nothing_flag = False
-        self.cmd_vel_msg = Twist()
-
-        self.frame_skip = 1     # 3프레임 마다 계산
-        self._frame_count = 0
-
-        # warp 관련 기본값
-        self.img_x = 0
-        self.img_y = 0
-        self.offset_x = 20  # BEV에서 좌우 여유. 필요하면 조절
-
-        self.enabled = True   # 기본값: FSM 없이 단독 돌릴 때도 동작하도록
-        rospy.Subscriber("/lkas_enable", Bool, self.enable_cb, queue_size=1)
-
-    def enable_cb(self, msg: Bool):
-        self.enabled = msg.data
-
-    # ---------------------------------------------------------------------
-    # 색 기반 차선 검출
-    # ---------------------------------------------------------------------
-    def detect_color(self, img):
-        # BGR → HSV 변환
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        # 노란색 범위
-        yellow_lower = np.array([15, 80, 0], dtype=np.uint8)
-        yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
-
-        # 흰색 범위
-        white_lower = np.array([0, 0, 230], dtype=np.uint8)
-        white_upper = np.array([179, 40, 255], dtype=np.uint8)
-
-        # 마스크 계산
-        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
-        white_mask = cv2.inRange(hsv, white_lower, white_upper)
-
-        # 두 마스크 OR 연산
-        blend_mask = yellow_mask | white_mask
-
-        # 원본 이미지에서 해당 색만 남기기
-        return cv2.bitwise_and(img, img, mask=blend_mask)
-
-    # ---------------------------------------------------------------------
-    # Bird-Eye-View warp
-    # ---------------------------------------------------------------------
-    def img_warp(self, img):
-        self.img_x, self.img_y = img.shape[1], img.shape[0]
-
-        # src는 원본 이미지 상에서의 포인트 (사다리꼴)
-        src_center_offset = [100, 158]
-        src = np.array(
-            [
-                [0, self.img_y - 1],
-                [src_center_offset[0], src_center_offset[1]],
-                [self.img_x - src_center_offset[0], src_center_offset[1]],
-                [self.img_x - 1, self.img_y - 1],
-            ],
-            dtype=np.float32,
-        )
-
-        # dst는 BEV 상에서의 직사각형 영역
-        # → offset_x 만큼 좌우 여유를 둔 박스로 투영
-        dst = np.array(
-            [
-                [self.offset_x, self.img_y],
-                [self.offset_x, 0],
-                [self.img_x - self.offset_x, 0],
-                [self.img_x - self.offset_x, self.img_y],
-            ],
-            dtype=np.float32,
-        )
-
-        matrix = cv2.getPerspectiveTransform(src, dst)
-        warp_img = cv2.warpPerspective(img, matrix, (self.img_x, self.img_y))
-        return warp_img
-
-    # ---------------------------------------------------------------------
-    # 이진화 + 중앙 영역 마스크
-    # ---------------------------------------------------------------------
-    # def img_binary(self, blend_line):
-    #     # ---- 중앙 마스크 파라미터 ----
-    #     center_y_ratio = 0.5     # 중앙점 세로 위치(화면 높이의 55%)
-    #     up_ratio = 0.00           # 중앙점에서 위로 지울 높이 비율
-    #     down_ratio = 0.00        # 중앙점에서 아래로 지울 높이 비율
-    #     half_width_ratio = 0.00  # 중앙 사각형의 좌우 반폭 비율
-
-    #     # 1) 기본 이진화
-    #     gray = cv2.cvtColor(blend_line, cv2.COLOR_BGR2GRAY)
-    #     _, binary_line = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY)
-
-    #     # 2) 중앙 사각형 마스크 처리
-    #     h, w = binary_line.shape
-    #     cx = w // 2
-    #     cy = int(h * center_y_ratio)
-    #     up = int(h * up_ratio)
-    #     dn = int(h * down_ratio)
-    #     hw = int(w * half_width_ratio)
-
-    #     x0, x1 = max(0, cx - hw), min(w, cx + hw)
-    #     y0, y1 = max(0, cy - up), min(h, cy + dn)
-    #     binary_line[y0:y1, x0:x1] = 0
-
-    #     return binary_line
-    def img_binary(self, blend_line):
-        # 1) 기본 이진화 (0/255)
-        gray = cv2.cvtColor(blend_line, cv2.COLOR_BGR2GRAY)
-        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY)
-
-        h, w = bw.shape
-
-        # 2) 너무 먼 앞(상단) 제거 -> "앞을 너무 봐서 생기는 오검출" 감소
-        #    값 올릴수록 더 가까운 영역만 봄 (0.40~0.70 사이에서 튜닝)
-        top_cut = int(h * 0.20)   # 예: 상단 50% 버림 → 하단 50%만 사용
-        bw[:top_cut, :] = 0
-
-        # 3) 중앙 제거 + 양쪽만 살리기 (숫자/문자 등 중앙 마킹 대부분 컷)
-        #    도로/카메라에 따라 튜닝 (left_end 0.35~0.50 / right_start 0.50~0.65)
-        left_end = int(w * 0.35)
-        right_start = int(w * 0.65)
-        bw[:, left_end:right_start] = 0
-
-        # 4) "세로로 긴 성분" 강조 (차선=세로로 길고, 횡단보도/숫자=가로/덩어리 성분)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 10))
-        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)   # 작은 덩어리 제거
-        bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)  # 끊긴 세로선 연결(약하게)
-
-        # 기존 코드가 0/1을 기대하니까 맞춰서 리턴
-        return (bw > 0).astype(np.uint8)
-
-
-    # ---------------------------------------------------------------------
-    # nothing일 때 기본 픽셀 위치
-    # ---------------------------------------------------------------------
-    def detect_nothing(self):
-        offset = int(self.img_x * 0.140625)
-
-        self.nothing_left_x_base = offset
-        self.nothing_right_x_base = self.img_x - offset
-
-        self.nothing_pixel_left_x = np.full(
-            self.nwindows, self.nothing_left_x_base, dtype=np.int32
-        )
-        self.nothing_pixel_right_x = np.full(
-            self.nwindows, self.nothing_right_x_base, dtype=np.int32
-        )
-
-        base_y = int(self.window_height / 2)
-        self.nothing_pixel_y = np.arange(
-            0, self.nwindows * base_y, base_y, dtype=np.int32
-        )
-
-    # ---------------------------------------------------------------------
-    # 슬라이딩 윈도우 탐색
-    # ---------------------------------------------------------------------
-    def window_search(self, binary_line):
-        h, w = binary_line.shape
-
-        # 1) 히스토그램
-        bottom_half = binary_line[h // 2 :, :]
-        histogram = np.sum(bottom_half, axis=0)
-
-        midpoint = w // 2
-        left_x_base = np.argmax(histogram[:midpoint])
-        right_x_base = np.argmax(histogram[midpoint:]) + midpoint
-
-        # 2) 초기 x 위치
-        left_x_current = (
-            left_x_base if left_x_base != 0 else self.nothing_left_x_base
-        )
-        right_x_current = (
-            right_x_base
-            if right_x_base != midpoint
-            else self.nothing_right_x_base
-        )
-
-        # 3) 출력 이미지 준비
-        out_img = (
-            np.dstack((binary_line, binary_line, binary_line))
-            .astype(np.uint8)
-            * 255
-        )
-
-        # window parameter
-        nwindows = self.nwindows
-        window_height = self.window_height
-        margin = 50
-        min_pix = int((margin * 2 * window_height) * 0.005)
-
-        # 모든 nonzero 픽셀
-        lane_y, lane_x = binary_line.nonzero()
-        lane_y = lane_y.astype(np.int32)
-        lane_x = lane_x.astype(np.int32)
-
-        # 픽셀 index를 담을 list
-        left_lane_idx_list = []
-        right_lane_idx_list = []
-
-        # 4) 윈도우 루프
-        for window in range(nwindows):
-            # window boundary (세로)
-            win_y_low = h - (window + 1) * window_height
-            win_y_high = h - window * window_height
-
-            # 좌/우 window x 범위
-            left_low = left_x_current - margin
-            left_high = left_x_current + margin
-            right_low = right_x_current - margin
-            right_high = right_x_current + margin
-
-            # 디버그용 사각형
-            if left_x_current != 0:
-                cv2.rectangle(
-                    out_img,
-                    (left_low, win_y_low),
-                    (left_high, win_y_high),
-                    (0, 255, 0),
-                    2,
-                )
-            if right_x_current != midpoint:
-                cv2.rectangle(
-                    out_img,
-                    (right_low, win_y_low),
-                    (right_high, win_y_high),
-                    (0, 0, 255),
-                    2,
-                )
-
-            # window 내 픽셀 인덱스 계산
-            in_window = (lane_y >= win_y_low) & (lane_y < win_y_high)
-
-            good_left_idx = np.where(
-                in_window & (lane_x >= left_low) & (lane_x < left_high)
-            )[0]
-            good_right_idx = np.where(
-                in_window & (lane_x >= right_low) & (lane_x < right_high)
-            )[0]
-
-            left_lane_idx_list.append(good_left_idx)
-            right_lane_idx_list.append(good_right_idx)
-
-            # 픽셀 수가 충분하면 window 중심을 업데이트
-            if len(good_left_idx) > min_pix:
-                left_x_current = int(np.mean(lane_x[good_left_idx]))
-            if len(good_right_idx) > min_pix:
-                right_x_current = int(np.mean(lane_x[good_right_idx]))
-
-        # 5) 전체 인덱스 하나로 합치기
-        left_lane_idx = (
-            np.concatenate(left_lane_idx_list)
-            if left_lane_idx_list
-            else np.array([], dtype=int)
-        )
-        right_lane_idx = (
-            np.concatenate(right_lane_idx_list)
-            if right_lane_idx_list
-            else np.array([], dtype=int)
-        )
-
-        # 6) 픽셀 좌표
-        left_x = lane_x[left_lane_idx]
-        left_y = lane_y[left_lane_idx]
-        right_x = lane_x[right_lane_idx]
-        right_y = lane_y[right_lane_idx]
-
-        # 7) fallback 처리
-        if len(left_x) == 0 and len(right_x) == 0:
-            left_x = self.nothing_pixel_left_x
-            left_y = self.nothing_pixel_y
-            right_x = self.nothing_pixel_right_x
-            right_y = self.nothing_pixel_y
-        else:
-            if len(left_x) == 0:
-                left_x = right_x - self.img_x // 2
-                left_y = right_y
-            elif len(right_x) == 0:
-                right_x = left_x + self.img_x // 2
-                right_y = left_y
-
-        # 8) 곡선 피팅
-        left_fit = np.polyfit(left_y, left_x, 2)
-        right_fit = np.polyfit(right_y, right_x, 2)
-
-        plot_y = np.linspace(0, h - 1, 5)
-        left_fit_x = left_fit[0] * plot_y**2 + left_fit[1] * plot_y + left_fit[2]
-        right_fit_x = right_fit[0] * plot_y**2 + right_fit[1] * plot_y + right_fit[2]
-        center_fit_x = (right_fit_x + left_fit_x) / 2.0
-
-        left_pts = np.int32(np.column_stack((left_fit_x, plot_y)))
-        right_pts = np.int32(np.column_stack((right_fit_x, plot_y)))
-        center_pts = np.int32(np.column_stack((center_fit_x, plot_y)))
-
-        cv2.polylines(out_img, [left_pts], False, (0, 0, 255), 5)
-        cv2.polylines(out_img, [right_pts], False, (0, 255, 0), 5)
-        cv2.polylines(out_img, [center_pts], False, (255, 0, 0), 3)
-
-        return out_img, left_pts, right_pts, center_pts, left_x, left_y, right_x, right_y
-
-    # ---------------------------------------------------------------------
-    # 픽셀 → 미터 변환 비율
-    # ---------------------------------------------------------------------
-    def meter_per_pixel(self):
-        # 고정된 월드 좌표 (타입 명시)
-        world_warp = np.array(
-            [[97, 1610], [109, 1610], [109, 1606], [97, 1606]], dtype=np.float32
-        )
-
-        # x 방향(세로) 거리
-        dx_x = world_warp[0, 0] - world_warp[3, 0]
-        dy_x = world_warp[0, 1] - world_warp[3, 1]
-        meter_x = dx_x * dx_x + dy_x * dy_x
-
-        # y 방향(가로) 거리
-        dx_y = world_warp[0, 0] - world_warp[1, 0]
-        dy_y = world_warp[0, 1] - world_warp[1, 1]
-        meter_y = dx_y * dx_y + dy_y * dy_y
-
-        meter_per_pix_x = meter_x / float(self.img_x)
-        meter_per_pix_y = meter_y / float(self.img_y)
-
-        return meter_per_pix_x, meter_per_pix_y
-
-    # ---------------------------------------------------------------------
-    # 곡률 계산
-    # ---------------------------------------------------------------------
-    def calc_curve(self, left_x, left_y, right_x, right_y):
-        # 평가할 y (화면 맨 아래 쪽)
-        y_eval = self.img_x - 1  # 원 코드 유지
-
-        # 픽셀 → 미터 변환 계수
-        meter_per_pix_x, meter_per_pix_y = self.meter_per_pixel()
-
-        # 월드 좌표(미터 단위)로 스케일링
-        left_y_m = left_y * meter_per_pix_y
-        left_x_m = left_x * meter_per_pix_x
-        right_y_m = right_y * meter_per_pix_y
-        right_x_m = right_x * meter_per_pix_x
-
-        # 2차 다항식 피팅
-        left_fit_cr = np.polyfit(left_y_m, left_x_m, 2)
-        right_fit_cr = np.polyfit(right_y_m, right_x_m, 2)
-
-        # 공통으로 쓰는 y_eval·meter_per_pix_y 곱
-        y_eval_m = y_eval * meter_per_pix_y
-
-        # 곡률 계산
-        a_l, b_l = left_fit_cr[0], left_fit_cr[1]
-        a_r, b_r = right_fit_cr[0], right_fit_cr[1]
-
-        denom_l = 2.0 * a_l
-        denom_r = 2.0 * a_r
-
-        left_curve_radius = (
-            (1.0 + (2.0 * a_l * y_eval_m + b_l) ** 2) ** 1.5 / np.abs(denom_l)
-        )
-        right_curve_radius = (
-            (1.0 + (2.0 * a_r * y_eval_m + b_r) ** 2) ** 1.5 / np.abs(denom_r)
-        )
-
-        return left_curve_radius, right_curve_radius
-
-    # ---------------------------------------------------------------------
-    # 차량 중심에서 차선 중앙까지 오프셋 계산
-    # ---------------------------------------------------------------------
-    def calc_vehicle_offset(self, sliding_window_img, left_x, left_y, right_x, right_y):
-        left_fit = np.polyfit(left_y, left_x, 2)
-        right_fit = np.polyfit(right_y, right_x, 2)
-
-        h = sliding_window_img.shape[0]
-        bottom_y = h - 1
-        y2 = bottom_y * bottom_y
-
-        a_l, b_l, c_l = left_fit
-        a_r, b_r, c_r = right_fit
-
-        bottom_x_left = a_l * y2 + b_l * bottom_y + c_l
-        bottom_x_right = a_r * y2 + b_r * bottom_y + c_r
-
-        img_center_x = sliding_window_img.shape[1] / 2.0
-        lane_center_x = (bottom_x_left + bottom_x_right) / 2.0
-        pixel_offset = img_center_x - lane_center_x
-
-        meter_per_pix_x, _ = self.meter_per_pixel()
-        vehicle_offset = pixel_offset * (2 * meter_per_pix_x)
-
-        return vehicle_offset
-
-    # ---------------------------------------------------------------------
-    # 카메라 기반 조향각 계산 (현재는 사용 안 함)
-    # ---------------------------------------------------------------------
-    def cam_cal_steer(self, left_curve_radius, right_curve_radius, vehicle_offset):
-        curvature = 2.0 / (left_curve_radius + right_curve_radius)
-        cam_steer = atan(curvature - 0.5 * curvature) * 100  # atan(0.5 * curvature)
-
-        if vehicle_offset > 0:
-            cam_steer = -cam_steer
-
-        return cam_steer
-
-    # ---------------------------------------------------------------------
-    # 속도/조향 명령 생성
-    # ---------------------------------------------------------------------
-    def ctrl_cmd(self, vehicle_offset):
-        self.cmd_vel_msg.linear.x = self.speed
-        self.cmd_vel_msg.angular.z = -vehicle_offset * self.trun_mutip
-        return self.cmd_vel_msg
-
-    # ---------------------------------------------------------------------
-    # 콜백
-    # ---------------------------------------------------------------------
-    def img_CB(self, data):
+        rospy.init_node("fsm_mux_node")
+
+        # --- 파라미터 ---
+        self.obstacle_topic         = rospy.get_param("~obstacle_topic", "/obstacle_state")
+        self.lkas_cmd_topic         = rospy.get_param("~lkas_cmd_topic", "/cmd_vel_lkas")
+        self.obstacle_cmd_topic     = rospy.get_param("~obstacle_cmd_topic", "/cmd_vel_obstacle")
+        self.m3_cmd_topic           = rospy.get_param("~m3_cmd_topic", "/cmd_vel_obstacle_m3")
+        self.cmd_out_topic          = rospy.get_param("~cmd_out_topic", "/cmd_vel")
+        self.mode_topic             = rospy.get_param("~mode_topic", "/drive_mode")
+        self.v2x_topic              = rospy.get_param("~v2x_topic", "/path_")
+        self.lkas_enable_topic      = rospy.get_param("~lkas_enable_topic", "/lkas_enable")
+        self.obstacle_enable_topic  = rospy.get_param("~obstacle_enable_topic", "/obstacle_enable")
+        self.mission3_enable_topic  = rospy.get_param("~mission3_enable_topic", "/mission3_enable")
+
+        # 메인 루프 주기
+        self.loop_rate = rospy.get_param("~loop_rate", 30.0)
+
+        # ----- Mission3 타이밍 파라미터 -----
+        self.m3_phase_time          = rospy.get_param("~m3_phase_time", 26.0)   # 첫 LKAS cmd 이후 기준
+        self.m3_turn_duration       = rospy.get_param("~m3_turn_duration", 2.5)
+        self.m3_turn_speed          = rospy.get_param("~m3_turn_speed", 0.18)
+        self.m3_turn_yaw            = rospy.get_param("~m3_turn_yaw", -0.4)
+
+        # mission3 DWA 강제 구간
+        self.m3_force_obs_duration  = rospy.get_param("~m3_force_obs_duration", 6.0)
+        # mission3 끝난 직후 base obstacle 강제 구간
+        self.m3_force_base_duration = rospy.get_param("~m3_force_base_duration", 7.0)
+
+        # ===== v2x 두 단계 타이머 =====
+        # mission5: 첫 번째 v2x 턴이 시작되는 시점
+        self.mission5_phase_time = rospy.get_param("~mission5_phase_time", 1.5)
+        # v2x: 두 번째 턴이 시작되는 시점 (기존 v2x_phase_time 유지)
+        self.v2x_phase_time2    = rospy.get_param("~v2x_phase_time", 11.5)
+
+        # 두 턴에 *각각* 쓰는 턴 지속 시간
+        self.mission5_turn_duration = rospy.get_param("~mission5_turn_duration", 3)
+        self.v2x_turn_duration      = rospy.get_param("~v2x_turn_duration", 5)
+
+        # mission5(1단계 턴) 조향값
+        self.mission5_turn_speed = rospy.get_param("~mission5_turn_speed", 0.1)
+        self.mission5_turn_yaw   = rospy.get_param("~mission5_turn_yaw", -0.08)
+
+        # v2x(2단계 턴) 조향값 (기존 파라미터 유지)
+        self.v2x_turn_speed      = rospy.get_param("~v2x_turn_speed", 0.1)
+        self.v2x_turn_yaw        = rospy.get_param("~v2x_turn_yaw", -0.04)
+
+        # --- 상태 변수들 ---
+        self.current_mode = DriveMode.LANE_FOLLOW
+
+        # 장애물 감지 상태
+        self.obstacle_state = False
+
+        # 마지막으로 받은 cmd_vel
+        self.last_lkas_cmd      = Twist()
+        self.last_obstacle_cmd  = Twist()   # base obstacle
+        self.last_m3_cmd        = Twist()   # mission3 DWA
+        self.have_lkas_cmd      = False
+        self.have_obstacle_cmd  = False
+        self.have_m3_cmd        = False
+
+        # V2X 모드 (필요하면 나중에 FSM/출력 로직에 사용)
+        self.v2x_mode = "D"
+
+        # ----- 타이머 / 페이즈 상태 -----
+        self.start_time = None                 # lab_time_m3 기준 시작 시각 (첫 LKAS cmd 시점)
+        self.m3_phase = Mission3Phase.BEFORE
+        self.m3_turn_start_time = None
+        self.m3_force_obs_start_time = None
+        self.m3_force_base_start_time = None   # base 강제 구간 시작 시각
+
+        self.v2x_phase = V2XPhase.WAIT_START
+        self.v2x_start_time = None
+        self.v2x_turn_start_time = None
+        self.v2x_step = 0   # 0: 아직 없음, 1: 1단계 턴, 2: 2단계 턴
+
+        # 로그 주기
+        self.log_dt = rospy.get_param("~log_dt", 0.5)
+        self.last_log_time = None
+
+        # --- Pub/Sub ---
+        rospy.Subscriber(self.obstacle_topic,        Bool,   self.obstacle_cb,      queue_size=1)
+        rospy.Subscriber(self.lkas_cmd_topic,        Twist,  self.lkas_cmd_cb,      queue_size=1)
+        rospy.Subscriber(self.obstacle_cmd_topic,    Twist,  self.obstacle_cmd_cb,  queue_size=1)
+        rospy.Subscriber(self.m3_cmd_topic,          Twist,  self.m3_cmd_cb,        queue_size=1)
+        rospy.Subscriber(self.v2x_topic,             String, self.v2x_cb,           queue_size=1)
+
+        self.cmd_pub              = rospy.Publisher(self.cmd_out_topic,          Twist,  queue_size=1)
+        self.mode_pub             = rospy.Publisher(self.mode_topic,             String, queue_size=1)
+        self.lkas_enable_pub      = rospy.Publisher(self.lkas_enable_topic,      Bool,   queue_size=1)
+        self.obstacle_enable_pub  = rospy.Publisher(self.obstacle_enable_topic,  Bool,   queue_size=1)
+        self.mission3_enable_pub  = rospy.Publisher(self.mission3_enable_topic,  Bool,   queue_size=1)
+
+        # 메인 루프용 타이머
+        self.timer = rospy.Timer(rospy.Duration(1.0 / self.loop_rate), self.update)
+
+        rospy.loginfo("[FSM_MUX] node started.")
+        rospy.loginfo("[FSM_MUX] obstacle_topic=%s, lkas_cmd_topic=%s, obstacle_cmd_topic=%s, m3_cmd_topic=%s",
+                      self.obstacle_topic, self.lkas_cmd_topic,
+                      self.obstacle_cmd_topic, self.m3_cmd_topic)
+
+    # ======================
+    # 콜백들
+    # ======================
+
+    def obstacle_cb(self, msg: Bool):
+        self.obstacle_state = msg.data
+
+        # v2x COUNTING 중에 장애물 다시 뜨면 타이머 리셋
+        if (
+            self.m3_phase == Mission3Phase.DONE
+            and self.v2x_phase == V2XPhase.COUNTING
+            and msg.data
+        ):
+            self.v2x_start_time = rospy.get_time()
+            rospy.loginfo("[FSM_MUX] v2x lab time reset (obstacle re-detected).")
+
+    def lkas_cmd_cb(self, msg: Twist):
+        self.last_lkas_cmd = msg
+
+        if not self.have_lkas_cmd:
+            rospy.loginfo("[FSM_MUX] first LKAS cmd received.")
+        self.have_lkas_cmd = True
+
+        # 첫 LKAS cmd 들어오는 타이밍에 lab_time_m3 시작
+        if self.start_time is None:
+            self.start_time = rospy.get_time()
+            self.last_log_time = self.start_time
+            rospy.loginfo("[FSM_MUX] lab_time_m3 START (t_m3=0.0, from first LKAS cmd).")
+
+    def obstacle_cmd_cb(self, msg: Twist):
+        # base obstacle 회피 from base_obstacle_avoid_node
+        self.last_obstacle_cmd = msg
+        self.have_obstacle_cmd = True
+
+    def m3_cmd_cb(self, msg: Twist):
+        # mission3_node (DWA)에서 오는 cmd
+        self.last_m3_cmd = msg
+        self.have_m3_cmd = True
+
+    def v2x_cb(self, msg: String):
+        self.v2x_mode = msg.data
+
+    # ======================
+    #  FSM + 타이머 메인 로직
+    # ======================
+
+    def update(self, event):
         now = rospy.get_time()
-        if not self.enabled:
+
+        if self.start_time is None:
+            t_m3 = 0.0
+        else:
+            t_m3 = now - self.start_time
+
+        # --- 미션3 페이즈 업데이트 ---
+        self.update_mission3_phase(now, t_m3)
+
+        # --- 기본 모드 업데이트 (장애물 기반 + 미션3 강제 구간 반영) ---
+        old_mode = self.current_mode
+        self.update_mode_basic()
+        new_mode = self.current_mode
+
+        # --- v2x 페이즈 업데이트 (미션3 끝난 이후) ---
+        self.update_v2x_phase(now, old_mode, new_mode)
+
+        # --- 모드 / enable 플래그 publish ---
+        self.publish_mode()
+
+        # --- 최종 cmd_vel publish (MUX + mission3/v2x override) ---
+        self.publish_cmd(now)
+
+        # --- lab time 로그 (log_dt마다) ---
+        if self.v2x_start_time is None:
+            t_v2x = 0.0
+        else:
+            t_v2x = max(0.0, now - self.v2x_start_time)
+
+        if (self.last_log_time is None) or (now - self.last_log_time >= self.log_dt):
+            rospy.loginfo(
+                "[FSM_MUX] t_m3=%.1f (%s), t_v2x=%.1f (%s), mode=%s, obstacle=%s",
+                t_m3,
+                self.m3_phase.name,
+                t_v2x,
+                self.v2x_phase.name,
+                self.current_mode.name,
+                str(self.obstacle_state),
+            )
+            self.last_log_time = now
+
+    # ---------- Mission3 Phase ----------
+
+    def update_mission3_phase(self, now, t_m3):
+        if self.start_time is None:
             return
-        
-        self._frame_count += 1
-        if self._frame_count % self.frame_skip != 0:
+
+        if self.m3_phase == Mission3Phase.BEFORE:
+            if t_m3 >= self.m3_phase_time:
+                self.m3_phase = Mission3Phase.TURNING
+                self.m3_turn_start_time = now
+                rospy.loginfo("[FSM_MUX] Mission3 TURNING start (t_m3=%.1f)", t_m3)
+
+        elif self.m3_phase == Mission3Phase.TURNING:
+            if now - self.m3_turn_start_time >= self.m3_turn_duration:
+                self.m3_phase = Mission3Phase.FORCE_OBS
+                self.m3_force_obs_start_time = now
+                rospy.loginfo("[FSM_MUX] Mission3 FORCE_OBS (mission3_node) start")
+
+        elif self.m3_phase == Mission3Phase.FORCE_OBS:
+            # mission3_node 강제 구간 끝 → base_obstacle 강제 구간으로 전이
+            if now - self.m3_force_obs_start_time >= self.m3_force_obs_duration:
+                self.m3_phase = Mission3Phase.FORCE_BASE
+                self.m3_force_base_start_time = now
+                rospy.loginfo("[FSM_MUX] Mission3 FORCE_BASE (base_obstacle) start")
+
+        elif self.m3_phase == Mission3Phase.FORCE_BASE:
+            # base_obstacle 강제 구간 끝 → DONE
+            if now - self.m3_force_base_start_time >= self.m3_force_base_duration:
+                self.m3_phase = Mission3Phase.DONE
+                rospy.loginfo("[FSM_MUX] Mission3 sequence DONE")
+
+    # ---------- 기본 DriveMode 업데이트 ----------
+
+    def update_mode_basic(self):
+        """
+        - 미션3 FORCE_OBS 시: 무조건 OBSTACLE_AVOID (mission3_node 사용)
+        - 미션3 FORCE_BASE 시: 무조건 OBSTACLE_AVOID (base_obstacle 사용)
+        - 그 외: obstacle_state True → OBSTACLE_AVOID, False → LANE_FOLLOW
+        """
+        # 미션3 강제 구간 (DWA + base 둘 다)에서는 장애물 상태와 관계 없이
+        # 항상 OBSTACLE_AVOID 모드 유지
+        if self.m3_phase in (Mission3Phase.FORCE_OBS, Mission3Phase.FORCE_BASE):
+            if self.current_mode != DriveMode.OBSTACLE_AVOID:
+                reason = "FORCE_OBS(mission3)" if self.m3_phase == Mission3Phase.FORCE_OBS \
+                         else "FORCE_BASE(base_obstacle)"
+                rospy.loginfo("[FSM_MUX] -> OBSTACLE_AVOID (%s)", reason)
+            self.current_mode = DriveMode.OBSTACLE_AVOID
             return
-        # 1) 이미지 변환
-        img = self.bridge.compressed_imgmsg_to_cv2(data)
 
-        # === 해상도 1/2 DOWN ===
-        h, w = img.shape[:2]
-        img = cv2.resize(img, (w // 2, h // 2))
+        # 평상시: obstacle_state 기반
+        if self.obstacle_state and self.current_mode != DriveMode.OBSTACLE_AVOID:
+            rospy.loginfo("[FSM_MUX] -> OBSTACLE_AVOID (obstacle_state=True)")
+            self.current_mode = DriveMode.OBSTACLE_AVOID
 
-        # 2) 윈도우 파라미터
-        self.nwindows = 10
-        self.window_height = img.shape[0] // self.nwindows
+        elif (not self.obstacle_state) and self.current_mode != DriveMode.LANE_FOLLOW:
+            rospy.loginfo("[FSM_MUX] -> LANE_FOLLOW (obstacle_state=False)")
+            self.current_mode = DriveMode.LANE_FOLLOW
 
-        # 3) 파이프라인: warp → 색 검출 → 이진화
-        warp_img = self.img_warp(img)
-        blend_img = self.detect_color(warp_img)
-        binary_img = self.img_binary(blend_img)
+    # ---------- V2X Phase (2단계 TURNING) ----------
 
-        # 4) nothing 초기값 설정
-        if not self.nothing_flag:
-            self.detect_nothing()
-            self.nothing_flag = True
+    def update_v2x_phase(self, now, old_mode, new_mode):
+        # 1) v2x 타이머 시작 조건
+        if (
+            self.m3_phase == Mission3Phase.DONE
+            and self.v2x_phase == V2XPhase.WAIT_START
+            and old_mode == DriveMode.OBSTACLE_AVOID
+            and new_mode == DriveMode.LANE_FOLLOW
+            and not self.obstacle_state
+        ):
+            self.v2x_phase = V2XPhase.COUNTING
+            self.v2x_start_time = now
+            self.v2x_turn_start_time = None
+            self.v2x_step = 0
+            rospy.loginfo("[FSM_MUX] v2x lab time START")
 
-        # 5) 슬라이딩 윈도우로 차선 검출
-        (
-            sliding_window_img,
-            left,
-            right,
-            center,
-            left_x,
-            left_y,
-            right_x,
-            right_y,
-        ) = self.window_search(binary_img)
+        # 2) COUNTING 상태에서 두 턴 시작 타이밍 관리
+        if (
+            self.v2x_phase == V2XPhase.COUNTING
+            and self.v2x_start_time is not None
+            and not self.obstacle_state
+        ):
+            t_v2x = now - self.v2x_start_time
 
-        # 6) 곡률 / 오프셋 계산
-        left_curve_radius, right_curve_radius = self.calc_curve(
-            left_x, left_y, right_x, right_y
+            # (1) 아직 아무 턴도 안 했고, mission5 시점이 되면 1단계 턴 시작
+            if self.v2x_step == 0 and t_v2x >= self.mission5_phase_time:
+                self.v2x_phase = V2XPhase.TURNING
+                self.v2x_turn_start_time = now
+                self.v2x_step = 1
+                rospy.loginfo("[FSM_MUX] v2x TURNING #1 (mission5) start (t_v2x=%.1f)", t_v2x)
+
+            # (2) 1단계 턴은 이미 끝났고, 두 번째 타임스탬프에 도달하면 2단계 턴 시작
+            elif self.v2x_step == 1 and t_v2x >= self.v2x_phase_time2:
+                self.v2x_phase = V2XPhase.TURNING
+                self.v2x_turn_start_time = now
+                self.v2x_step = 2
+                rospy.loginfo("[FSM_MUX] v2x TURNING #2 start (t_v2x=%.1f)", t_v2x)
+
+        # 3) TURNING 상태에서 각 턴의 지속시간 관리
+        elif self.v2x_phase == V2XPhase.TURNING and self.v2x_turn_start_time is not None:
+            dt_turn = now - self.v2x_turn_start_time
+
+            # 1단계 턴 종료 → 다시 COUNTING 상태로
+            if self.v2x_step == 1:
+                if dt_turn >= self.mission5_turn_duration:
+                    self.v2x_phase = V2XPhase.COUNTING
+                    self.v2x_turn_start_time = None
+                    # step=1 유지 → "1단계 턴은 끝났다" 표시
+                    rospy.loginfo("[FSM_MUX] v2x TURNING #1 end, back to COUNTING")
+
+            # 2단계 턴 종료 → 전체 v2x 시퀀스 끝
+            elif self.v2x_step == 2:
+                if dt_turn >= self.v2x_turn_duration:
+                    self.v2x_phase = V2XPhase.DONE
+                    self.v2x_turn_start_time = None
+                    rospy.loginfo("[FSM_MUX] v2x TURNING #2 end, sequence DONE")
+
+    # ---------- 모드 / enable publish ----------
+
+    def publish_mode(self):
+        # drive_mode 문자열
+        mode_msg = String()
+        mode_msg.data = self.current_mode.name
+        self.mode_pub.publish(mode_msg)
+
+        # LKAS enable : LANE_FOLLOW 일 때만 True
+        lkas_en = Bool()
+        lkas_en.data = (self.current_mode == DriveMode.LANE_FOLLOW)
+        self.lkas_enable_pub.publish(lkas_en)
+
+        # mission3_enable : 미션3 FORCE_OBS 구간에만 True (DWA만 켬)
+        m3_en = Bool()
+        m3_en.data = (self.m3_phase == Mission3Phase.FORCE_OBS)
+        self.mission3_enable_pub.publish(m3_en)
+
+        # base obstacle_enable :
+        #  - DriveMode 가 OBSTACLE_AVOID 이고
+        #  - 미션3 FORCE_OBS(=DWA) 가 아닐 때 True
+        #    → FORCE_BASE 구간 + 일반 obstacle 구간 모두 포함
+        obs_en = Bool()
+        obs_en.data = (
+            self.current_mode == DriveMode.OBSTACLE_AVOID
+            and self.m3_phase != Mission3Phase.FORCE_OBS
         )
-        vehicle_offset = self.calc_vehicle_offset(
-            sliding_window_img, left_x, left_y, right_x, right_y
-        )
+        self.obstacle_enable_pub.publish(obs_en)
 
-        # 7) 제어 명령 생성
-        ctrl_cmd_msg = self.ctrl_cmd(vehicle_offset)
+    # ---------- cmd_vel publish (MUX + override) ----------
 
-        # 8) 일정 주기로만 cmd_vel publish (0.1s)
-        if now - self.start_time >= 0.1:
-            self.ctrl_pub.publish(ctrl_cmd_msg)
-            self.start_time = now
+    def publish_cmd(self, now):
+        """
+        현재 DriveMode에 따라 lkas / obstacle cmd 중 하나 선택해서 /cmd_vel로 publish
+        + Mission3 TURN / v2x TURN 구간에서는 고정 조향으로 override
+        + Mission3 FORCE_OBS 구간에서는 mission3_node cmd 우선 사용
+        + Mission3 FORCE_BASE 구간에서는 base_obstacle cmd 강제 사용
+        + v2x TURNING 은 1단계/2단계에 따라 서로 다른 조향값 사용
+        """
+        cmd = Twist()
+
+        # 기본 MUX
+        if self.current_mode == DriveMode.LANE_FOLLOW:
+            if self.have_lkas_cmd:
+                cmd = copy.deepcopy(self.last_lkas_cmd)
+            else:
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+
+        elif self.current_mode == DriveMode.OBSTACLE_AVOID:
+            # Mission3 FORCE_OBS 구간이면 mission3_node cmd 우선
+            if self.m3_phase == Mission3Phase.FORCE_OBS:
+                if self.have_m3_cmd:
+                    cmd = copy.deepcopy(self.last_m3_cmd)
+                elif self.have_obstacle_cmd:
+                    # 혹시 mission3 cmd가 아직 없다면 base obstacle로 fallback
+                    cmd = copy.deepcopy(self.last_obstacle_cmd)
+                else:
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.0
+            else:
+                # FORCE_BASE + 일반 OBSTACLE_AVOID 둘 다 base obstacle 사용
+                if self.have_obstacle_cmd:
+                    cmd = copy.deepcopy(self.last_obstacle_cmd)
+                else:
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.0
+
+        # ----- Mission3 TURNING 구간: 고정 조향 override -----
+        if self.m3_phase == Mission3Phase.TURNING:
+            cmd = Twist()
+            cmd.linear.x = self.m3_turn_speed
+            cmd.angular.z = self.m3_turn_yaw
+
+        # ----- v2x TURNING 구간: 고정 조향 override (1단계/2단계) -----
+        if self.v2x_phase == V2XPhase.TURNING:
+            cmd = Twist()
+            if self.v2x_step == 1:
+                # mission5 (1단계 턴)
+                cmd.linear.x = self.mission5_turn_speed
+                cmd.angular.z = self.mission5_turn_yaw
+            else:
+                # 2단계 v2x 턴
+                cmd.linear.x = self.v2x_turn_speed
+                cmd.angular.z = self.v2x_turn_yaw
+
+        self.cmd_pub.publish(cmd)
+
+
+def main():
+    node = FSMMuxNode()
+    rospy.spin()
 
 
 if __name__ == "__main__":
-    lkas = LKAS()
-    rospy.spin()
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
