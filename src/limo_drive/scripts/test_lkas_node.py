@@ -49,7 +49,7 @@ class BlackROI_ScanSteer:
         self.min_width = int(rospy.get_param("~min_width", 10))
 
         # scanline params
-        self.y_start = int(rospy.get_param("~y_start", 180))
+        self.y_start = int(rospy.get_param("~y_start", 190))
         self.y_gap = int(rospy.get_param("~y_gap", 10))
         self.num_points = int(rospy.get_param("~num_points", 11))
 
