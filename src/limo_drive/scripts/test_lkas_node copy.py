@@ -36,7 +36,7 @@ class BlackROI_ScanSteer:
         self.scale = float(rospy.get_param("~scale", 0.5))
 
         # --- unified params (원본 그대로) ---
-        self.black_thr = int(rospy.get_param("~black_thr", 180))
+        self.black_thr = int(rospy.get_param("~black_thr", 190))
         self.top_cut_ratio = float(rospy.get_param("~top_cut_ratio", 0.30))
         self.bottom_cut_ratio = float(rospy.get_param("~bottom_cut_ratio", 0.00))
 
