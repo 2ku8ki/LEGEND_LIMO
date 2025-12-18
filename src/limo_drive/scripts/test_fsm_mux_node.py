@@ -96,7 +96,7 @@ class FSMMuxNode:
 
         # v2x(2단계 턴) 조향값 (기존 파라미터 유지)
         self.v2x_turn_speed      = rospy.get_param("~v2x_turn_speed", 0.1)
-        self.v2x_turn_yaw        = rospy.get_param("~v2x_turn_yaw", -0.1)
+        self.v2x_turn_yaw        = rospy.get_param("~v2x_turn_yaw", -0.13)
 
         # --- 상태 변수들 ---
         self.current_mode = DriveMode.LANE_FOLLOW
