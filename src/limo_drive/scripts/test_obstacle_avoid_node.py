@@ -223,11 +223,11 @@ class Limo_obstacle_avoidence:
 
         # ===== 이머전시(근접) 파라미터 =====
         # (아래 로직은 1번 코드의 LiDAR_scan/decide_direction에서 그대로 사용)
-        self.emergency_dist = rospy.get_param("~emergency_dist", 0.35)
-        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.17)
+        self.emergency_dist = rospy.get_param("~emergency_dist", 0.4)
+        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.2)
         self.scan_degree    = rospy.get_param("~scan_degree", 60.0)
 
-        self.default_speed  = 0.35
+        self.default_speed  = 0.4
         self.backward_speed = rospy.get_param("~backward_speed", 0.15)
 
         # ===== LiDAR 상태 =====
